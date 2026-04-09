@@ -1,0 +1,16 @@
+\section{Environment Extensions: Electric Vehicle Energy Layer}
+To model the constraints of a real-world electric ride-hailing fleet, we extended the base \texttt{pyhailing} environment with a physical energy layer. 
+
+\subsection{Battery Dynamics}
+Each vehicle $v \in V$ is assigned a state-of-charge (SOC) variable $s_v \in [0, B]$, where $B = 62.0 \text{ kWh}$ represents the battery capacity. The SOC transitions according to:
+\begin{equation}
+s_v(t + \Delta t) = \min \left( B, s_v(t) - \eta \cdot d_{\text{traveled}} + \chi \cdot \Delta t_{\text{idle}} \right)
+\end{equation}
+where $\eta = 0.15 \text{ kWh/km}$ is the energy consumption rate and $\chi = 72.0 \text{ kW}$ is the constant charging rate dispensed at every charging station (lot).
+
+\subsection{Energy-Aware Feasibility}
+An assignment $a = (v, r)$ between vehicle $v$ and request $r$ is considered feasible only if:
+\begin{equation}
+s_v \geq \eta \cdot (d(v, r_{\text{origin}}) + d(r_{\text{origin}}, r_{\text{dest}}) + d(r_{\text{dest}}, \text{CS}_{\text{nearest}})) + \epsilon
+\end{equation}
+where $\text{CS}_{\text{nearest}}$ is the nearest charging station from the request destination and $\epsilon = 5.0 \text{ kWh}$ is a safety energy reserve. This constraint ensures that vehicles are never permitted to reach an unrecoverable 0\% SOC state.

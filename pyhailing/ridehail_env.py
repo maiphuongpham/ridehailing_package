@@ -112,9 +112,15 @@ class RidehailEnv(gym.Env):
     _S_PER_DAY = _S_PER_HR * _HRS_PER_DAY
 
     _MAX_TIME = _S_PER_DAY
-    _NEVER = _MAX_TIME + 1
+    _NEVER = 1e9
     _MAX_WAIT = 300 # 5 min in seconds
     
+    # Energy constants
+    BATTERY_CAPACITY = 62.0 # kWh
+    CONSUMPTION_RATE = 0.15 # kWh/km
+    CHARGING_RATE = 72.0   # kW (72 kWh/hr = 0.02 kWh/s)
+    ENERGY_RESERVE = 5.0   # kWh (Strict reserve)
+
     TRAVEL_COST = 0.53 # $/km
     FIXED_REWARD = 10.75 # $/km
     VARIABLE_REWARD_DIST = 4.02 # $/km
@@ -420,13 +426,13 @@ class RidehailEnv(gym.Env):
 
         self.action_space = spaces.Dict({
             # First, for each pending request, indicate whether we reject it.
-            "req_rejections": spaces.MultiBinary(self.num_pending_requests),
+            "req_rejections": spaces.Box(low=0, high=1, shape=(self.num_pending_requests,), dtype=int),
             # Second, for each pending request, indicate which vehicle to assign to it
             # No-assignment is indicated by setting values to self.num_vehicles
-            "req_assgts": spaces.MultiDiscrete(np.full((self.num_pending_requests,), fill_value=self._num_vehicles + 1, dtype=np.int)),
+            "req_assgts": spaces.Box(low=0, high=self._num_vehicles, shape=(self.num_pending_requests,), dtype=int),
             # Third, for each vehicle, a repositioning instruction.
             # No-assignment is indicated by setting values to self.num_lots
-            "reposition": spaces.MultiDiscrete(np.full((self._num_vehicles,), fill_value=self.num_lots + 1, dtype=np.int)),
+            "reposition": spaces.MultiDiscrete(np.full((self._num_vehicles,), fill_value=self.num_lots + 1, dtype=int)),
         })
 
     
@@ -439,10 +445,10 @@ class RidehailEnv(gym.Env):
         # Check to confirm that we need to update the action space's shape
         if self.action_space.spaces["req_rejections"].shape != (self.num_pending_requests,):
 
-            self.action_space.spaces["req_rejections"] = spaces.MultiBinary(self.num_pending_requests)
+            self.action_space.spaces["req_rejections"] = spaces.Box(low=0, high=1, shape=(self.num_pending_requests,), dtype=int)
 
-            self.action_space.spaces["req_assgts"] = spaces.MultiDiscrete(
-                np.full((self.num_pending_requests,), fill_value=self._num_vehicles + 1, dtype=np.int)
+            self.action_space.spaces["req_assgts"] = spaces.Box(
+                low=0, high=self._num_vehicles, shape=(self.num_pending_requests,), dtype=int
             )
         
 
@@ -653,7 +659,7 @@ class RidehailEnv(gym.Env):
 
         # If there's nothing to check, return an empty boolean array
         if len(vs) == 0:
-            return np.full((0,), fill_value=True, dtype=np.bool)
+            return np.full((0,), fill_value=True, dtype=bool)
 
         # Get the mean travel times from vehicles' next available location to requests' origins
         travel_times = self._geom.travel_time(
@@ -675,8 +681,43 @@ class RidehailEnv(gym.Env):
         # Vehicles can't have a second non-preemptable job already lined up
         job_feasible = np.isin(vs["j2m"].to_numpy(), (Jobs.IDLE, Jobs.REPOSITION, Jobs.NULL))
 
+        # --- Energy Feasibility Check ---
+        # A vehicle is energy-feasible if it can reach the pickup, complete the trip,
+        # AND still have enough energy to reach the nearest charging station (lot) 
+        # with a safety reserve.
+        
+        # 1. Dist to pickup
+        d_to_pickup = self._geom.dist(
+            o=vs[["avail_x", "avail_y"]].to_numpy(),
+            d=reqs[["ox", "oy"]].to_numpy(),
+            pairwise=False
+        ).flatten()
+        
+        # 2. Trip distance
+        d_trip = self._geom.dist(
+            o=reqs[["ox", "oy"]].to_numpy(),
+            d=reqs[["dx", "dy"]].to_numpy(),
+            pairwise=False
+        ).flatten()
+        
+        # 3. Dist to nearest charger from destination
+        # All lots are chargers in this environment.
+        dists_to_lots = self._geom.dist(
+            o=reqs[["dx", "dy"]].to_numpy(),
+            d=self._lots[["x", "y"]].to_numpy(),
+            pairwise=True
+        ) # shape: (num_reqs, num_lots) or (num_lots,) if num_reqs=1 due to flattening in core.py
+        
+        if dists_to_lots.ndim == 1:
+            d_to_charger = np.array([np.min(dists_to_lots)])
+        else:
+            d_to_charger = np.min(dists_to_lots, axis=1)
+        
+        energy_needed = (d_to_pickup + d_trip + d_to_charger) * self.CONSUMPTION_RATE
+        energy_feasible = vs["soc"].to_numpy() >= (energy_needed + self.ENERGY_RESERVE)
+
         # Done.
-        return time_feasible & job_feasible
+        return time_feasible & job_feasible & energy_feasible
     
     
     def _get_server_job_col_updates(self, req_idxs, v_idxs) -> np.ndarray:
@@ -1012,7 +1053,7 @@ class RidehailEnv(gym.Env):
             req_assgts = np.where(np.isin(req_assgts, bad_vs), self._V, req_assgts)
 
         # Note the indices of the requests that have been rejected
-        rejected_reqs = reqs_idx[action["req_rejections"].astype(np.bool)]
+        rejected_reqs = reqs_idx[action["req_rejections"].astype(bool)]
 
         # A mask to indicate which of the pending requests received an assignment
         assgd_reqs_mask = req_assgts != self._V
@@ -1065,6 +1106,45 @@ class RidehailEnv(gym.Env):
         # The indices of the vehicles that received a repositioning assignment
         repos_v_idxs = self._vehicles.index[has_repos_assgt]
         
+        # Note the lots that they were told to reposition to
+        repos_lots = self._lots.loc[reposs[has_repos_assgt], :]
+
+        # --- Energy Feasibility for Repositioning ---
+        if len(repos_v_idxs) > 0:
+            repos_dists = self._geom.dist(
+                o=self._vehicles.loc[repos_v_idxs, ["x", "y"]].to_numpy(),
+                d=repos_lots[["x", "y"]].to_numpy(),
+                pairwise=False
+            ).flatten()
+            repos_energy_needed = repos_dists * self.CONSUMPTION_RATE
+            repos_feasible = self._vehicles.loc[repos_v_idxs, "soc"].to_numpy() >= (repos_energy_needed + self.ENERGY_RESERVE)
+            
+            if not np.all(repos_feasible):
+                bad_v_idxs = repos_v_idxs[~repos_feasible]
+                logging.warning(f"Ignoring energy-infeasible repositioning for vehicles: {bad_v_idxs}")
+                
+                # To avoid "no instruction" errors, we must still give these vehicles an assignment.
+                # We'll assign them to stay at the lot nearest their current location (which is where they were idling).
+                bad_v_locs = self._vehicles.loc[bad_v_idxs, ["x", "y"]].to_numpy()
+                dists_to_all_lots = self._geom.dist(
+                    o=bad_v_locs,
+                    d=self._lots[["x", "y"]].to_numpy(),
+                    pairwise=True
+                )
+                
+                if dists_to_all_lots.ndim == 1:
+                    nearest_lot_idxs = np.array([np.argmin(dists_to_all_lots)])
+                else:
+                    nearest_lot_idxs = np.argmin(dists_to_all_lots, axis=1)
+                
+                # Update reposs with these local lot indices
+                reposs[bad_v_idxs] = self._lots.index[nearest_lot_idxs]
+                
+                # Re-calculate masks and indexes for the subsequent assignment logic
+                has_repos_assgt = reposs != self._D
+                repos_v_idxs = self._vehicles.index[has_repos_assgt]
+                repos_lots = self._lots.loc[reposs[has_repos_assgt], :]
+        
         # Make sure that any vehicle that is currently idle either received a repositioning
         # assignment or a service assignment.
         self._check_null_v_assgts(serving_idxs, repos_v_idxs)
@@ -1107,6 +1187,25 @@ class RidehailEnv(gym.Env):
         job_dists = self._get_jobs_dists()
         dists_traveled = job_pct_completed * job_dists
         reward -= np.sum(dists_traveled) * self.TRAVEL_COST
+
+        # Energy Layer: Update vehicle SOC based on distance traveled and charging duration
+        total_dist_traveled = np.sum(dists_traveled, axis=1)
+        energy_consumed = total_dist_traveled * self.CONSUMPTION_RATE
+        
+        # Charging: any job that is Jobs.IDLE charges the vehicle.
+        # Note: job_durations and job_pct_completed handle the time spent being idle.
+        job_types = self._vehicles[["j1m", "j2m", "j3m"]].to_numpy()
+        idle_mask = (job_types == Jobs.IDLE)
+        charging_time_per_job = job_pct_completed * job_durations
+        total_charging_time = np.sum(charging_time_per_job * idle_mask, axis=1)
+        energy_charged = total_charging_time * (self.CHARGING_RATE / 3600.0) # kW to kWh/s
+        
+        # Update SOC and clip to battery capacity
+        self._vehicles["soc"] = np.clip(
+            self._vehicles["soc"] - energy_consumed + energy_charged,
+            0.0,
+            self.BATTERY_CAPACITY
+        )
 
         # How many jobs will be completed by the time of the next epoch?
         num_to_remove = (next_epoch_time >= job_dtimes).sum(axis=1)
@@ -1313,6 +1412,9 @@ class RidehailEnv(gym.Env):
                     "j3ox", "j3oy", "j3dx", "j3dy"
                 ]].to_numpy().reshape(self._V, 3, 2, 2).astype(np.float64)
             ),
+            
+            # Vehicles' current SOC (battery level in kWh)
+            "v_soc": self._vehicles["soc"].to_numpy().astype(np.float64),
         }
 
         return obs
@@ -1513,6 +1615,14 @@ class RidehailEnv(gym.Env):
         # The next time at which vehicles will trigger an epoch: never
         vehicles["epoch_t"] = self._NEVER
 
+        # Initialize SOC (battery level)
+        # We'll start them between 50% and 100% capacity
+        vehicles["soc"] = self._vehicle_sampler.uniform(
+            low=0.5 * self.BATTERY_CAPACITY,
+            high=self.BATTERY_CAPACITY,
+            size=self._num_vehicles
+        )
+
         # Done. Set to the env's vehicles
         self._vehicles = vehicles
 
@@ -1522,11 +1632,11 @@ class RidehailEnv(gym.Env):
 
         noop = {
             # Don't reject any of the pending requests
-            "req_rejections": np.full((self.num_pending_requests,), fill_value=0, dtype=np.int),
+            "req_rejections": np.full((self.num_pending_requests,), fill_value=0, dtype=int),
             # Don't assign any vehicles to any of the pending requests
-            "req_assgts": np.full((self.num_pending_requests,), fill_value=self._V, dtype=np.int),
+            "req_assgts": np.full((self.num_pending_requests,), fill_value=self._V, dtype=int),
             # Don't give any vehicles a repositioning assignment
-            "reposition": np.full((self._V,), fill_value=self._D, dtype=np.int)
+            "reposition": np.full((self._V,), fill_value=self._D, dtype=int)
         }
         
         return noop
